@@ -9,6 +9,7 @@ only supports Starling, but additional gateways can be easily implemented.
 Install it:
 
     $ script/plugin install git://github.com/mojodna/active_queue.git
+    $ sudo gem install fiveruns-memcache-client -s http://gems.github.com
 
 Define a Message:
 
