@@ -1,0 +1,233 @@
+#!/usr/bin/env ruby
+require 'optparse'
+
+OPTIONS = {
+  :environment => (ENV['RAILS_ENV'] || "development").dup,
+  :detach      => false,
+  :num_processes => 1,
+}
+
+ARGV.clone.options do |opts|
+  opts.on("-q", "--queue=name", String,
+          "Specifies the queue to process with this server.") { |v| OPTIONS[:queue] = v }
+  opts.on("-d", "--daemon", "Make server run as a daemon.") { OPTIONS[:detach] = true }
+  opts.on("-e", "--environment=name", String,
+          "Specifies the environment to run this server under (test/development/production).",
+          "Default: #{OPTIONS[:environment]}") { |v| OPTIONS[:environment] = v }
+  opts.on("-l", "--log=path", String, "Specifies a path to log script output.") { |v| OPTIONS[:log] = v }
+  opts.on("-n", "--num_processes=n", Integer,
+          "Specifies the number of processors to run.",
+          "Default is #{OPTIONS[:num_processes]}.") { |v| OPTIONS[:num_processes] = v.to_i }
+  opts.on("-p", "--pidfile=path", String,
+          "Specifies a pidfile to use.") { |v| OPTIONS[:pidfile] = v }
+
+  opts.separator ""
+
+  opts.on("", "--available-queues", "Display a list of available queues.") { OPTIONS[:available_queues] = true }
+  opts.on("-h", "--help", "Show this help message.") { puts opts; exit }
+
+  opts.parse!
+end
+
+# pre-set RAILS_ENV so things are loaded properly
+ENV["RAILS_ENV"] = OPTIONS[:environment]
+
+require File.dirname(__FILE__) + '/../config/boot'
+require File.join(RAILS_ROOT, 'config', 'environment')
+
+# log to stdout (which will be logged according --log-path)
+Object.const_set(:RAILS_DEFAULT_LOGGER, Logger.new(STDOUT))
+
+if OPTIONS[:available_queues]
+  aq_path = File.join(RAILS_ROOT, "app", "active_queue")
+  Dir.glob(File.join(aq_path, "**", "*.rb")).each do |m|
+    class_name = m.sub(aq_path + File::SEPARATOR, '').sub(/\.rb$/, '').camelize
+    klass = class_name.split('::').inject(Object){ |klass,part| klass.const_get(part) } rescue nil
+  end
+
+  puts "Available Queues:\n"
+  puts ActiveQueue::Queue.available_queues.collect { |q| "  #{q}" }
+  exit
+end
+
+unless OPTIONS[:queue]
+  puts "=> Error: you must specify a queue for this worker. Use --available-queues to show available queues."
+  exit 1
+end
+
+# write startup message to the controlling tty
+puts "=> Rails queue listener starting for queue #{OPTIONS[:queue]}"
+
+if OPTIONS[:pidfile]
+  if File.exists?(OPTIONS[:pidfile])
+    pid = File.read(OPTIONS[:pidfile]).chomp.gsub(/[^0-9]/, '')
+    running = Process.kill(0, pid.to_i) rescue nil
+
+    if running
+      puts "=> Process already running (pid #{pid}). Exiting."
+      exit 1
+    else
+      puts "=> Cleaning up stale pidfile."
+      File.delete(OPTIONS[:pidfile])
+    end
+  end
+end
+
+# Detach the process, get our new pid (if we're going to detach)
+if OPTIONS[:detach]
+  # Close IO handles
+  ObjectSpace.each_object(IO) do |io|
+    unless [STDIN, STDOUT, STDERR].include?(io)
+      begin
+        io.close unless io.closed?
+      rescue Exception
+      end
+    end
+  end
+
+  # Establishes this process as a new session and process group leader, with no controlling tty.
+  Process.setsid
+
+  # parent exits, child continues
+  begin
+    exit if pid = fork
+  rescue Errno::EWOULDBLOCK
+    sleep 5
+    retry
+  end
+
+  # child exits, grandchild continues
+  begin
+    exit if pid = fork
+  rescue Errno::EWOULDBLOCK
+    sleep 5
+    retry
+  end
+
+  File.umask 0000
+end
+
+# Now that we've detached and written the pidfile, continue with redirecting IO
+# (again, only if we're detaching)
+if OPTIONS[:detach]
+  # Redirect IO
+  begin; STDIN.reopen('/dev/null'); rescue Exception; end
+  if OPTIONS[:log]
+    begin
+      STDOUT.reopen(OPTIONS[:log], "a")
+      STDOUT.sync = true
+    rescue Exception
+      begin; STDOUT.reopen('/dev/null'); rescue Exception; end
+    end
+  else
+    begin; STDOUT.reopen('/dev/null'); rescue Exception; end
+  end
+  begin; STDERR.reopen(STDOUT); rescue Exception; end
+  STDERR.sync = true
+end
+
+# Write the pidfile
+if OPTIONS[:pidfile]
+  File.open(OPTIONS[:pidfile], "w") { |f| f.write Process.pid }
+end
+
+# write startup message into the log
+puts "=> Rails queue listener starting for queue #{OPTIONS[:queue]}" if OPTIONS[:detach]
+
+$child_pids = []
+
+def kill_children
+  if $running
+    $child_pids.each { |pid| Process.kill("INT", pid) rescue nil }
+    $running = false
+  else
+    $child_pids.each { |pid| Process.kill("TERM", pid) rescue nil }
+    exit 1
+  end
+end
+
+def remove_pid
+  File.delete(OPTIONS[:pidfile]) if OPTIONS[:pidfile]
+end
+
+trap(:INT) {
+  kill_children
+  remove_pid
+}
+
+trap(:TERM) {
+  kill_children
+  remove_pid
+}
+
+$running = true
+
+$0 = OPTIONS[:queue]
+
+OPTIONS[:num_processes].times do |i|
+  $child_pids << fork {
+    $0 = "#{OPTIONS[:queue]} #{Process.ppid} #{i+1} / #{OPTIONS[:num_processes]}"
+
+    # force loading (but not reloading) of all models by saying their name
+    # this is necessary when objects are passed directly through the queue and
+    # they have not yet been defined; much more natural than explicitly loading
+    # all models that *might* need to be deserialized
+    # Adapted from PragDave's Annotate Models plugin.
+    model_path = File.join(RAILS_ROOT, "app", "models")
+    Dir.glob(File.join(model_path, "**", "*.rb")).each do |m|
+      class_name = m.sub(model_path + File::SEPARATOR, '').sub(/\.rb$/, '').camelize
+      klass = class_name.split('::').inject(Object){ |klass,part| klass.const_get(part) } rescue nil
+    end
+
+    message_class = "#{OPTIONS[:queue]}_message".camelize.constantize
+    queue = message_class.queue
+
+    trap(:INT) do
+      if $running
+        $running = false
+      else
+        exit 1
+      end
+    end
+
+    trap(:TERM) do
+      if $running
+        $running = false
+      else
+        exit 1
+      end
+    end
+
+    message_class.startup if message_class.respond_to?(:startup)
+
+    while $running
+      begin
+        queue.process!
+      rescue ActiveQueue::EmptyQueueError
+        sleep rand(1000) / 1000.0
+      rescue ActiveQueue::InvalidMessageError => e
+        puts "Error! Got invalid message '#{e}' (#{e.class})."
+      rescue MemCache::MemCacheError => e
+        puts "Error! Got a MemCacheError: #{e}. Perhaps Starling isn't running?"
+        exit 1
+      rescue Object => e
+        puts "Error! Got an unhandled exception of type #{e.class}: #{e}"
+        puts e.backtrace * "\n"
+        exit 1
+      end
+    end
+
+    message_class.shutdown if message_class.respond_to?(:shutdown)
+  }
+end
+
+Process.wait
+
+puts "=> Shutting down..."
+
+kill_children
+
+# Cleanup after ourselves.
+if OPTIONS[:pidfile]
+  File.delete(OPTIONS[:pidfile]) if File.exists?(OPTIONS[:pidfile])
+end
