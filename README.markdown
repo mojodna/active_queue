@@ -13,6 +13,7 @@ Install it:
 
 Define a Message:
 
+    require 'active_queue'
     class EmailMessage < ActiveQueue::Message
       attributes :recipient, :subject, :body
 
@@ -20,6 +21,30 @@ Define a Message:
         DefaultMailer.deliver_email(recipient, subject, body)
       end
     end
+
+Configure ActiveQueue (in a Rails app, this goes in
+`config/initializers/active_queue.rb`):
+
+    config_file = File.join(RAILS_ROOT, 'config', 'active_queue.yml')
+    config = YAML.load(ERB.new(File.read(config_file)).result)[RAILS_ENV]
+
+    require "active_queue/gateways/#{config['gateway']}"
+
+    gateway_class_name = "#{config['gateway']}_gateway".camelize
+    gateway_class      = ActiveQueue.const_get(gateway_class_name)
+
+    ActiveQueue::Queue.default_gateway = gateway_class.new(config['servers'])
+
+`config/active_queue.yml`:
+
+    development:
+      gateway: starling
+      servers:
+        - localhost:22122
+    test:
+      gateway: local
+    production:
+      gateway: local
 
 Install and start starling:
 
